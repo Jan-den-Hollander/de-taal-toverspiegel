@@ -14,14 +14,15 @@ interface Message {
   role: 'user' | 'model';
   nl: string;
   it: string;
-  ph?: string;
+  // ✅ FIX 1: 'ph' (fonetiek) verwijderd uit het Message type
   score?: number;
   heard?: string;
 }
 
+// ✅ FIX 2: Systeemprompt in het Nederlands, geen 'ph' meer in het JSON
 const SYSTEM_PROMPT = `Je bent Sofie, een vriendelijke en geduldige Nederlandse vrouw uit Amsterdam. Je helpt Italiaanse sprekers om Nederlands te oefenen via spiegelgesprekken en shadowing.
 REGELS: ÉÉN korte Nederlandse zin per beurt (max 12 woorden). Eindig altijd met een vraag. Gebruik natuurlijk, modern Nederlands. Spreek warm en bemoedigend. Verbeter fouten vriendelijk met ✏️ Je kunt zeggen: [correctie] op een nieuwe regel in "nl".
-ANTWOORD ALLEEN met geldige JSON: {"nl":"Nederlandse zin","it":"Italiaanse vertaling","ph":"fonetische hint"}`;
+ANTWOORD ALLEEN met geldige JSON, zonder uitleg of Markdown: {"nl":"Nederlandse zin","it":"Italiaanse vertaling"}`;
 
 export default function App() {
   const [isCamOn, setIsCamOn] = useState(false);
@@ -77,7 +78,7 @@ export default function App() {
       setStatus('Spiegel uit · Specchio spento');
     } else {
       try {
-        setStatus('Avvio fotocamera...');
+        setStatus('Camera starten...');
         if (!navigator.mediaDevices?.getUserMedia) throw new Error("No camera support");
         const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
         if (videoRef.current) {
@@ -94,6 +95,8 @@ export default function App() {
     }
   };
 
+  // ✅ FIX 3: Alleen de Nederlandse tekst meegeven, geen instructietekst.
+  // ✅ FIX 4: speechConfig met Nederlandse stem (Leda) toegevoegd.
   const speakIt = async (text: string) => {
     if (!text) return;
     setIsSpeaking(true);
@@ -102,8 +105,15 @@ export default function App() {
       const aiInstance = getAI();
       const response = await aiInstance.models.generateContent({
         model: "gemini-2.5-flash-preview-tts",
-        contents: [{ parts: [{ text: `Zeg duidelijk in het Nederlands: ${text}` }] }],
-        config: { responseModalities: [Modality.AUDIO] },
+        contents: [{ parts: [{ text }] }],
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: "Leda" }
+            }
+          }
+        },
       });
       const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
       if (base64Audio) {
@@ -175,13 +185,14 @@ export default function App() {
     return 0.5;
   };
 
+  // ✅ FIX 5: Geen 'ph' meer in de gespreksgeschiedenis of het opgeslagen bericht
   const generateAIResponse = async (history: Message[]) => {
     setIsThinking(true);
     setStatus('De spiegel denkt na... · Lo specchio pensa...');
     const systemPrompt = `${SYSTEM_PROMPT}\nNiveau: ${level}. Huidig onderwerp: ${topic}.`;
     const contents = history.map(m => ({
       role: m.role === 'user' ? 'user' : 'model',
-      parts: [{ text: m.role === 'user' ? m.nl : JSON.stringify({ nl: m.nl, it: m.it, ph: m.ph }) }]
+      parts: [{ text: m.role === 'user' ? m.nl : JSON.stringify({ nl: m.nl, it: m.it }) }]
     }));
     try {
       const aiInstance = getAI();
@@ -191,7 +202,8 @@ export default function App() {
         config: { systemInstruction: systemPrompt, responseMimeType: "application/json" },
       });
       const data = JSON.parse(response.text || "{}");
-      const aiMsg: Message = { role: 'model', nl: data.nl || "Hoe gaat het met je?", it: data.it || "", ph: data.ph || "" };
+      // ✅ FIX 6: Geen 'ph' in het opgeslagen AI-bericht
+      const aiMsg: Message = { role: 'model', nl: data.nl || "Hoe gaat het met je?", it: data.it || "" };
       setMessages(prev => [...prev, aiMsg]);
       setIsThinking(false);
       speakIt(aiMsg.nl);
@@ -351,9 +363,9 @@ export default function App() {
               <div className={`max-w-[90%] px-3 py-2 rounded-xl text-[0.8rem] leading-relaxed ${msg.role === 'user' ? 'bg-white/5 border border-white/10 rounded-br-none italic text-white/80' : 'bg-gradient-to-br from-[#e8883a]/10 to-[#e8883a]/5 border border-[#e8883a]/20 rounded-bl-none'}`}>
                 {msg.role === 'model' ? (
                   <>
+                    {/* ✅ FIX 7: Alleen Nederlandse zin + Italiaanse vertaling. Geen fonetiek meer. */}
                     <span className="font-serif italic text-base text-[#f0a860] block mb-0.5">{msg.nl}</span>
                     <span className="text-[0.65rem] text-white/40 block leading-tight">{msg.it}</span>
-                    {msg.ph && <span className="text-[0.6rem] text-[#e8883a]/50 italic block mt-1">/{msg.ph}/</span>}
                   </>
                 ) : (
                   <>
