@@ -10,16 +10,15 @@ import { motion, AnimatePresence } from 'motion/react';
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
 
+// ✅ 'error' toegevoegd aan role — voor de foutbubbel in het gespreksveld
 interface Message {
-  role: 'user' | 'model';
+  role: 'user' | 'model' | 'error';
   nl: string;
   it: string;
-  // ✅ FIX 1: 'ph' (fonetiek) verwijderd uit het Message type
   score?: number;
   heard?: string;
 }
 
-// ✅ FIX 2: Systeemprompt in het Nederlands, geen 'ph' meer in het JSON
 const SYSTEM_PROMPT = `Je bent Sofie, een vriendelijke en geduldige Nederlandse vrouw uit Amsterdam. Je helpt Italiaanse sprekers om Nederlands te oefenen via spiegelgesprekken en shadowing.
 REGELS: ÉÉN korte Nederlandse zin per beurt (max 12 woorden). Eindig altijd met een vraag. Gebruik natuurlijk, modern Nederlands. Spreek warm en bemoedigend. Verbeter fouten vriendelijk met ✏️ Je kunt zeggen: [correctie] op een nieuwe regel in "nl".
 ANTWOORD ALLEEN met geldige JSON, zonder uitleg of Markdown: {"nl":"Nederlandse zin","it":"Italiaanse vertaling"}`;
@@ -69,6 +68,15 @@ export default function App() {
     prevMessagesLength.current = messages.length;
   }, [messages.length, isThinking]);
 
+  // ✅ Safari-fix: AudioContext initialiseren of hervatten tijdens een klik
+  const ensureAudioContext = () => {
+    if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+      audioContextRef.current.resume();
+    } else if (!audioContextRef.current) {
+      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+    }
+  };
+
   const toggleCam = async () => {
     if (isCamOn) {
       streamRef.current?.getTracks().forEach(t => t.stop());
@@ -95,8 +103,6 @@ export default function App() {
     }
   };
 
-  // ✅ FIX 3: Alleen de Nederlandse tekst meegeven, geen instructietekst.
-  // ✅ FIX 4: speechConfig met Nederlandse stem (Leda) toegevoegd.
   const speakIt = async (text: string) => {
     if (!text) return;
     setIsSpeaking(true);
@@ -143,7 +149,9 @@ export default function App() {
     }
   };
 
+  // ✅ Safari-fix: ensureAudioContext bij de microfoonklik
   const startRecording = () => {
+    ensureAudioContext();
     try {
       const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
       if (!SR) { setStatus('Spraakherkenning niet ondersteund'); return; }
@@ -185,39 +193,89 @@ export default function App() {
     return 0.5;
   };
 
-  // ✅ FIX 5: Geen 'ph' meer in de gespreksgeschiedenis of het opgeslagen bericht
-  const generateAIResponse = async (history: Message[]) => {
+  // ✅ Nieuwe generateAIResponse:
+  //    - retryCount parameter: 0 = eerste poging, 1 = automatische herpoging
+  //    - Tijdslimiet van 12 seconden per poging
+  //    - Eerste poging: gemini-2.5-flash
+  //    - Herpoging: gemini-2.0-flash (sneller, lichter)
+  //    - Na 2 mislukte pogingen: foutbubbel in het gespreksveld
+  const generateAIResponse = async (history: Message[], retryCount = 0) => {
     setIsThinking(true);
-    setStatus('De spiegel denkt na... · Lo specchio pensa...');
+    setStatus(retryCount > 0
+      ? 'Even opnieuw proberen... · Ritento...'
+      : 'De spiegel denkt na... · Lo specchio pensa...'
+    );
+
     const systemPrompt = `${SYSTEM_PROMPT}\nNiveau: ${level}. Huidig onderwerp: ${topic}.`;
-    const contents = history.map(m => ({
-      role: m.role === 'user' ? 'user' : 'model',
-      parts: [{ text: m.role === 'user' ? m.nl : JSON.stringify({ nl: m.nl, it: m.it }) }]
-    }));
+
+    // Foutberichten NIET meesturen naar de AI
+    const contents = history
+      .filter(m => m.role !== 'error')
+      .map(m => ({
+        role: m.role === 'user' ? 'user' : 'model',
+        parts: [{ text: m.role === 'user'
+          ? m.nl
+          : JSON.stringify({ nl: m.nl, it: m.it }) }]
+      }));
+
     try {
       const aiInstance = getAI();
-      const response = await aiInstance.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents: contents.length > 0 ? contents : [{ role: 'user', parts: [{ text: 'Start het gesprek met een warme Nederlandse begroeting en één openingsvraag.' }] }],
+
+      // Tijdslimiet: 12 seconden. Na die tijd automatisch herpoging.
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('TIMEOUT')), 12000)
+      );
+
+      const responsePromise = aiInstance.models.generateContent({
+        // Eerste poging: snel+slim model. Herpoging: sneller/lichter model.
+        model: retryCount > 0 ? "gemini-2.0-flash" : "gemini-2.5-flash",
+        contents: contents.length > 0
+          ? contents
+          : [{ role: 'user', parts: [{ text: 'Start het gesprek met een warme Nederlandse begroeting en één openingsvraag.' }] }],
         config: { systemInstruction: systemPrompt, responseMimeType: "application/json" },
       });
+
+      const response = await Promise.race([responsePromise, timeoutPromise]);
       const data = JSON.parse(response.text || "{}");
-      // ✅ FIX 6: Geen 'ph' in het opgeslagen AI-bericht
-      const aiMsg: Message = { role: 'model', nl: data.nl || "Hoe gaat het met je?", it: data.it || "" };
+      const aiMsg: Message = {
+        role: 'model',
+        nl: data.nl || "Hoe gaat het met je?",
+        it: data.it || "",
+      };
       setMessages(prev => [...prev, aiMsg]);
       setIsThinking(false);
       speakIt(aiMsg.nl);
+
     } catch {
+      // Eerste mislukking → stil automatisch herproberenop sneller model
+      if (retryCount === 0) {
+        setStatus('Verbinding traag, even opnieuw...');
+        setTimeout(() => generateAIResponse(history, 1), 2000);
+        return;
+      }
+
+      // Tweede mislukking → toon uitgebreide foutbubbel in gespreksveld
       setIsThinking(false);
-      setStatus('Oeps, de spiegel is wazig · Lo specchio è appannato');
+      setStatus('Server bezet · Server sovraccarico');
+      const errorMsg: Message = { role: 'error', nl: '', it: '' };
+      setMessages(prev => [...prev, errorMsg]);
     }
   };
 
-  const startNewConversation = () => { setMessages([]); setScore(0); generateAIResponse([]); };
+  // ✅ Safari-fix: ensureAudioContext ook bij Nieuw Gesprek
+  const startNewConversation = () => {
+    ensureAudioContext();
+    setMessages([]);
+    setScore(0);
+    generateAIResponse([]);
+  };
 
   const downloadTranscript = () => {
     if (!messages.length) return;
-    const text = messages.map(m => `[${m.role === 'user' ? 'JIJ' : 'SOFIE'}]\nNL: ${m.nl}\nIT: ${m.it || '-'}\n`).join('\n---\n\n');
+    const text = messages
+      .filter(m => m.role !== 'error')
+      .map(m => `[${m.role === 'user' ? 'JIJ' : 'SOFIE'}]\nNL: ${m.nl}\nIT: ${m.it || '-'}\n`)
+      .join('\n---\n\n');
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
     a.download = 'gesprek-nederlands.txt';
@@ -358,28 +416,91 @@ export default function App() {
 
         {/* Chat */}
         <div className="w-full h-[35vh] min-h-[250px] bg-black/30 border border-[#e8883a]/10 rounded-xl overflow-y-auto p-3 space-y-3 scrollbar-thin mb-4">
-          {messages.map((msg, i) => (
-            <motion.div key={i} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
-              <div className={`max-w-[90%] px-3 py-2 rounded-xl text-[0.8rem] leading-relaxed ${msg.role === 'user' ? 'bg-white/5 border border-white/10 rounded-br-none italic text-white/80' : 'bg-gradient-to-br from-[#e8883a]/10 to-[#e8883a]/5 border border-[#e8883a]/20 rounded-bl-none'}`}>
-                {msg.role === 'model' ? (
-                  <>
-                    {/* ✅ FIX 7: Alleen Nederlandse zin + Italiaanse vertaling. Geen fonetiek meer. */}
-                    <span className="font-serif italic text-base text-[#f0a860] block mb-0.5">{msg.nl}</span>
-                    <span className="text-[0.65rem] text-white/40 block leading-tight">{msg.it}</span>
-                  </>
-                ) : (
-                  <>
-                    <span>{msg.nl}</span>
-                    {msg.score !== undefined && (
-                      <div className={`mt-1.5 text-[0.55rem] font-bold uppercase px-1.5 py-0.5 rounded-sm inline-block ${msg.score === 2 ? 'bg-green-500/10 text-green-400' : msg.score === 1 ? 'bg-yellow-500/10 text-yellow-400' : 'bg-red-500/10 text-red-400'}`}>
-                        {msg.score === 2 ? '✓ Prima!' : msg.score === 1 ? '~ Bijna!' : '↻ Probeer opnieuw'}
-                      </div>
-                    )}
-                  </>
-                )}
-              </div>
-            </motion.div>
-          ))}
+
+          {messages.map((msg, i) => {
+
+            // ✅ Foutbubbel — verschijnt alleen als de server twee keer niet reageert
+            if (msg.role === 'error') {
+              return (
+                <motion.div key={i} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
+                  className="flex flex-col items-start">
+                  <div className="w-full px-3 py-3 rounded-xl rounded-bl-none text-[0.72rem] leading-relaxed bg-amber-900/20 border border-amber-500/30 space-y-2">
+
+                    {/* Hoofdmelding */}
+                    <p className="text-amber-300 font-semibold text-[0.75rem]">
+                      ⚠️ De spiegel is even buiten bereik
+                    </p>
+
+                    {/* Uitleg server / rustige tijden */}
+                    <p className="text-amber-200/70">
+                      🕐 De gratis server is het drukst overdag en 's avonds laat
+                      (dan zijn Amerikaanse gamers actief). Rustigste tijden om te oefenen:
+                      vroeg in de ochtend of tussen 13:00 en 15:00.
+                    </p>
+
+                    {/* Oefentip */}
+                    <p className="text-amber-200/70">
+                      🎤 Geen nood! Klik op de microfoon om een zin op te lezen,
+                      en op de luidspreker 🔊 om hem terug te horen.
+                      Zo kun je toch al oefenen terwijl je wacht.
+                    </p>
+
+                    {/* Italiaanse versie van de oefentip */}
+                    <p className="text-amber-200/50 text-[0.65rem] italic">
+                      🇮🇹 Nessun problema! Clicca sul microfono per leggere una frase
+                      e sull'altoparlante per riascoltarla. Puoi esercitarti lo stesso!
+                    </p>
+
+                    {/* Opnieuw proberen knop */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setMessages(prev => prev.filter((_, idx) => idx !== i));
+                        generateAIResponse(messages.filter(m => m.role !== 'error'));
+                      }}
+                      className="mt-1 px-3 py-1.5 rounded-lg bg-amber-500/20 border border-amber-500/40 text-amber-300 text-[0.6rem] uppercase tracking-widest hover:bg-amber-500/30 transition-colors"
+                    >
+                      ↻ Opnieuw proberen · Riprova
+                    </button>
+
+                  </div>
+                </motion.div>
+              );
+            }
+
+            // ✅ Normale berichten — ongewijzigd
+            return (
+              <motion.div key={i} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}
+                className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
+                <div className={`max-w-[90%] px-3 py-2 rounded-xl text-[0.8rem] leading-relaxed ${
+                  msg.role === 'user'
+                    ? 'bg-white/5 border border-white/10 rounded-br-none italic text-white/80'
+                    : 'bg-gradient-to-br from-[#e8883a]/10 to-[#e8883a]/5 border border-[#e8883a]/20 rounded-bl-none'
+                }`}>
+                  {msg.role === 'model' ? (
+                    <>
+                      <span className="font-serif italic text-base text-[#f0a860] block mb-0.5">{msg.nl}</span>
+                      <span className="text-[0.65rem] text-white/40 block leading-tight">{msg.it}</span>
+                    </>
+                  ) : (
+                    <>
+                      <span>{msg.nl}</span>
+                      {msg.score !== undefined && (
+                        <div className={`mt-1.5 text-[0.55rem] font-bold uppercase px-1.5 py-0.5 rounded-sm inline-block ${
+                          msg.score === 2 ? 'bg-green-500/10 text-green-400'
+                          : msg.score === 1 ? 'bg-yellow-500/10 text-yellow-400'
+                          : 'bg-red-500/10 text-red-400'
+                        }`}>
+                          {msg.score === 2 ? '✓ Prima!' : msg.score === 1 ? '~ Bijna!' : '↻ Probeer opnieuw'}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              </motion.div>
+            );
+          })}
+
           {isThinking && (
             <div className="flex gap-1.5 p-2 bg-[#e8883a]/5 border border-[#e8883a]/10 rounded-xl rounded-bl-none w-12">
               <div className="w-1 h-1 bg-[#f0a860] rounded-full animate-bounce" />
